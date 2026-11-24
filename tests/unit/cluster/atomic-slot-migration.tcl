@@ -4398,3 +4398,66 @@ start_cluster 3 3 {tags {external:skip cluster} overrides {cluster-node-timeout 
         wait_for_asm_done
     }
 }
+
+# Return the id of the node that owns `slot`, as `node_id` sees it.
+proc slot_owner {node_id slot} {
+    foreach range [R $node_id cluster slots] {
+        lassign $range start end owner
+        if {$start <= $slot && $slot <= $end} { return [lindex $owner 2] }
+    }
+    return ""
+}
+
+start_cluster 3 3 {tags {external:skip cluster} overrides {cluster-node-timeout 60000 cluster-allow-replica-migration no}} {
+    test "Source losing another slot to a higher epoch during handoff does not crash" {
+        # Node 0 owns slots 0-5461. Keys in slot 0 migrate to node 1; keys in
+        # slot 1 stay on node 0 until another primary claims slot 1.
+        populate_slot 2 -idx 0 -slot 0
+        populate_slot 10 -idx 0 -slot 1
+        wait_for_ofs_sync [Rn 0] [Rn 3]
+
+        # Hold the migration in the handoff: the source pauses writes and
+        # replica traffic, and the destination never takes the slot over.
+        R 0 config set cluster-slot-migration-write-pause-timeout 60000
+        R 1 debug asm-failpoint "import-main-channel" "takeover"
+        set task_id [R 1 cluster migration import 0 0]
+        # The source pauses writes from "handoff" until the migration ends; with
+        # the failpoint it then waits in "stream-eof" for the destination.
+        wait_for_condition 1000 10 {
+            [migration_status 0 $task_id state] eq {stream-eof}
+        } else {
+            fail "ASM task did not reach stream-eof: [migration_status 0 $task_id state]"
+        }
+
+        # Node 2 claims slot 1 with a higher config epoch, as a failover in
+        # another shard can. Node 0 has keys in slot 1, so it must drop them.
+        set node2_id [R 2 cluster myid]
+        R 2 cluster setslot 1 node $node2_id
+        R 2 cluster bumpepoch
+        wait_for_condition 1000 10 {
+            [slot_owner 0 1] eq $node2_id
+        } else {
+            fail "node 0 did not learn that node 2 owns slot 1"
+        }
+
+        # Node 0 survives, is still in the handoff, and keeps slot 0.
+        assert_equal {PONG} [R 0 ping]
+        assert_equal {stream-eof} [migration_status 0 $task_id state]
+        assert_equal [R 0 cluster myid] [slot_owner 0 0]
+
+        # Once the pause ends, node 0 and its replica drop the keys of slot 1.
+        R 0 cluster migration cancel id $task_id
+        wait_for_condition 1000 10 {
+            [R 0 cluster countkeysinslot 1] == 0 &&
+            [R 3 cluster countkeysinslot 1] == 0
+        } else {
+            fail "keys of the lost slot 1 were not trimmed"
+        }
+        assert_equal 2 [R 0 cluster countkeysinslot 0]
+        assert_equal 2 [R 3 cluster countkeysinslot 0]
+
+        R 1 cluster migration cancel id $task_id
+        R 1 debug asm-failpoint "" ""
+        R 0 config set cluster-slot-migration-write-pause-timeout 10000
+    }
+}

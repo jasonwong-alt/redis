@@ -2599,9 +2599,22 @@ void clusterUpdateSlotsConfigWith(clusterNode *sender, uint64_t senderConfigEpoc
          * a slave.
          *
          * In order to maintain a consistent state between keys and slots
-         * we need to remove all the keys from the slots we lost. */
-        for (j = 0; j < dirty_slots_count; j++)
-            clusterDelKeysInSlot(dirty_slots[j], 0);
+         * we need to remove all the keys from the slots we lost.
+         *
+         * Deleting keys propagates DELs to replicas, which is not allowed while
+         * replica traffic is paused, e.g. while an atomic slot migration of
+         * another slot is in its handoff. In that case schedule a trim of the
+         * lost slots instead: trim jobs run only once the pause is over. */
+        if (isPausedActions(PAUSE_ACTION_REPLICA)) {
+            slotRangeArray *lost = NULL;
+            for (j = 0; j < dirty_slots_count; j++)
+                lost = slotRangeArrayAppend(lost, dirty_slots[j]);
+            asmTrimSlotsIfNotOwned(lost);
+            slotRangeArrayFree(lost);
+        } else {
+            for (j = 0; j < dirty_slots_count; j++)
+                clusterDelKeysInSlot(dirty_slots[j], 0);
+        }
     }
 }
 
@@ -3297,9 +3310,13 @@ int clusterProcessPacket(clusterLink *link) {
                             /* A failover occurred in the shard where `sender` belongs to and `sender` is no longer
                              * a primary. Update slot assignment to `master`, which is the new primary in the shard */
                             int slots = clusterMoveNodeSlots(sender, master);
-                            /* `master` is still a `slave` in this observer node's view; update its role and configEpoch */
+                            /* `master` is still a `slave` in this observer node's view; update its role and configEpoch.
+                             * The sender reports its primary's configEpoch as it last knew it, which can be stale
+                             * (e.g. a replica that just restarted from an old nodes.conf). Never move an epoch
+                             * backwards, and never let gossip overwrite our own configEpoch. */
                             clusterSetNodeAsMaster(master);
-                            master->configEpoch = senderConfigEpoch;
+                            if (master != myself && senderConfigEpoch > master->configEpoch)
+                                master->configEpoch = senderConfigEpoch;
                             serverLog(LL_NOTICE, "A failover occurred in shard %.40s; node %.40s (%s)"
                                     " lost %d slot(s) to node %.40s (%s) with a config epoch of %llu",
                                     sender->shard_id,
